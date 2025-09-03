@@ -1,621 +1,631 @@
-# role_based_data_entry_app.py
-# Single-file **data entry + analysis** app with a Streamlit UI *when available*,
-# and a **CLI fallback** (self-tests + CSV I/O) when Streamlit is **not installed**.
+# MySkillEdge – Analytics + Recommendations (Streamlit or CLI)
+# -----------------------------------------------------------------
+# This file can run in two modes:
+# 1) Streamlit UI (if `streamlit` is available) – ideal for Streamlit Cloud.
+# 2) CLI demo (no Streamlit installed) – prints JSON to stdout so it runs
+#    in restricted/sandbox environments that don’t allow adding packages.
 #
-# Roles supported: Student, University, HRDF, Company, Admin
-# Demo auth for Streamlit UI: username **123**, password **123** for ALL roles.
-#
-# ──────────────────────────────────────────────────────────────────────────────
-# How to run (UI):
-#   pip install streamlit pandas
-#   streamlit run role_based_data_entry_app.py
-#
-# How to run (CLI fallback – no Streamlit needed):
-#   python role_based_data_entry_app.py
-#   → runs self-tests, writes CSVs to ./data, and a test report to ./exports
-#
-# Notes:
-# - The CLI fallback exists to avoid "ModuleNotFoundError: No module named 'streamlit'".
-# - In CLI mode, no interactive UI is shown; the script exercises CRUD flows
-#   for all 5 roles and prints a summary + saves a JSON test report.
+# Fixes included in this version:
+# - Optional Streamlit import (prevents ModuleNotFoundError in sandbox).
+# - Proper `global` placement for vectorizer rebuild.
+# - **NEW**: Convert np.matrix → NumPy ndarray in learner profile vectors to
+#   avoid: "TypeError: np.matrix is not supported" in sklearn cosine_similarity.
+# - Added extra tests around vector shape and cosine call.
 
 from __future__ import annotations
-import os
 import json
-from datetime import datetime, date
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Set, Tuple
 
+import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-# Try Streamlit; if unavailable, switch to CLI mode gracefully
+# ---------------------------
+# Optional Streamlit import with safe fallback
+# ---------------------------
 try:
     import streamlit as st  # type: ignore
-    HAS_STREAMLIT = True
-except ModuleNotFoundError:
-    st = None  # type: ignore
-    HAS_STREAMLIT = False
+    STREAMLIT_AVAILABLE = True
+except Exception:  # pragma: no cover
+    STREAMLIT_AVAILABLE = False
 
-# ----------------------------------------------------------------------------
-# Config / paths
-# ----------------------------------------------------------------------------
-DATA_DIR = os.environ.get("RBDEA_DATA_DIR", "data")
-EXPORT_DIR = os.environ.get("RBDEA_EXPORT_DIR", "exports")
-os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(EXPORT_DIR, exist_ok=True)
+    class _DummyStreamlit:
+        """Minimal shim for decorators so the logic layer works without UI."""
+        def cache_data(self, *args, **kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
 
-# Provide a no-op cache decorator if Streamlit isn't present
-if HAS_STREAMLIT:
-    cache_data = st.cache_data  # pragma: no cover
-else:
-    def cache_data(*args, **kwargs):  # pragma: no cover
-        def deco(func):
-            return func
-        return deco
+        def cache_resource(self, *args, **kwargs):
+            def _decorator(fn):
+                return fn
+            return _decorator
 
-# ----------------------------------------------------------------------------
-# Data model (flat CSVs)
-# ----------------------------------------------------------------------------
-FILES: Dict[str, list] = {
-    "users.csv": ["user_id", "name", "role", "username", "password"],
-    "organizations.csv": ["org_id", "org_name", "type", "levy_balance_rm"],
-    "modules.csv": [
-        "module_code", "module_name", "industry", "claimable",
-        "claim_agency", "hours", "outcomes", "fee_rm"
-    ],
-    "enrollments.csv": ["enroll_id", "user_id", "module_code", "status", "grade", "attendance_hours"],
-    "attendance.csv": ["event_id", "enroll_id", "date", "hours", "mode"],
-    "jobs.csv": ["job_id", "org_id", "title", "skills", "location", "salary_min", "salary_max", "status"],
-    "applications.csv": ["app_id", "job_id", "user_id", "stage", "score"],
-    "claims.csv": ["claim_id", "claim_type", "org_id", "user_id", "module_code", "amount_rm", "status"],
-    "credit_map.csv": ["module_code", "university_org_id", "degree_program", "credits_awarded"],
-}
+    st = _DummyStreamlit()  # type: ignore
 
-# Seed some sensible defaults (includes FIVE default users, one per role)
-MOCK_ROWS: Dict[str, list] = {
-    "users.csv": [
-        ["S001", "Student One",   "student",   "123", "123"],
-        ["U001", "Uni Admin",      "university", "123", "123"],
-        ["H001", "HRDF Officer",   "hrdf",      "123", "123"],
-        ["C001", "Company Admin",  "company",   "123", "123"],
-        ["A001", "Admin User",     "admin",     "123", "123"],
-    ],
-    "organizations.csv": [
-        ["ORG_EE",  "Penang E&E Sdn Bhd", "employer", 120000],
-        ["ORG_MMU", "Multimedia University", "university", 0],
-    ],
-    "modules.csv": [
-        ["AI101", "AI for E&E (Certificate)", "E&E", "yes", "PTPK", 180, "Python; data wrangling", 12000],
-    ],
-}
+# =============================================================
+# Configuration
+# =============================================================
+DEFAULT_ALPHA = 0.5  # hybrid mixing factor α
+UNFINISHED_BOOST_RANGE = (0.4, 0.8)
+LOW_RATING_THRESHOLD = 3.5
+LOW_COMPLETION_THRESHOLD = 0.40
 
-# ----------------------------------------------------------------------------
-# Utilities
-# ----------------------------------------------------------------------------
+if STREAMLIT_AVAILABLE:  # UI-only config
+    st.set_page_config(page_title="MySkillEdge Demo (Analytics + Recommendations)", layout="wide")
 
-def ensure_csv(path: str, columns: list, seed_rows: list | None = None) -> None:
-    if not os.path.exists(path):
-        df = pd.DataFrame(seed_rows or [], columns=columns)
-        df.to_csv(path, index=False)
+# =============================================================
+# Synthetic Mock Data (idempotent)
+# =============================================================
+@st.cache_data(show_spinner=False)
+def seed_data() -> Dict[str, pd.DataFrame]:
+    # Users
+    users = pd.DataFrame([
+        {"user_id": 1, "name": "Amir Hakim", "role": "learner", "company_id": 1},
+        {"user_id": 2, "name": "Aisha Tan",  "role": "learner", "company_id": 1},
+        {"user_id": 3, "name": "Dr. Tan",    "role": "trainer", "company_id": None},
+        {"user_id": 4, "name": "Rahman HR",  "role": "employer","company_id": 1},
+        {"user_id": 5, "name": "Noraini",    "role": "admin",   "company_id": None},
+    ])
 
-@cache_data(show_spinner=False)
-def load_df(name: str) -> pd.DataFrame:
-    path = os.path.join(DATA_DIR, name)
-    ensure_csv(path, FILES[name], MOCK_ROWS.get(name))
-    return pd.read_csv(path)
+    # Companies
+    companies = pd.DataFrame([
+        {"company_id": 1, "name": "Penang E&E Sdn Bhd"},
+    ])
 
-@cache_data(show_spinner=False)
-def list_files() -> list:
-    return list(FILES.keys())
+    # Skills universe
+    skills = [
+        "python","sql","ml","excel","logistics","privacy","health","dashboards",
+        "statistics","pandas","nlp","cv","cloud","etl","javascript","powerbi"
+    ]
 
-def save_df(name: str, df: pd.DataFrame) -> None:
-    path = os.path.join(DATA_DIR, name)
-    df.to_csv(path, index=False)
-    # Invalidate Streamlit's cache if present (fixes AttributeError from calling function.clear())
-    if HAS_STREAMLIT:
-        try:
-            st.cache_data.clear()
-        except Exception:
-            pass
+    # Courses (with ratings & historical completion_rate for quality prior)
+    courses = pd.DataFrame([
+        {"course_id": 101, "title": "AI for E&E",                "description": "Intro to AI in Electronics",   "skills": "python, statistics, pandas",         "tags": "ai, electronics",     "rating": 4.6, "completion_rate": 0.62},
+        {"course_id": 102, "title": "Applied Machine Learning",  "description": "Regression & classification",   "skills": "ml, python, pandas",                "tags": "ml, model",           "rating": 4.4, "completion_rate": 0.58},
+        {"course_id": 103, "title": "Logistics Optimization",    "description": "Routing & WMS",                "skills": "excel, logistics",                   "tags": "ops, supply",         "rating": 4.0, "completion_rate": 0.55},
+        {"course_id": 104, "title": "Healthcare Data",           "description": "Privacy and dashboards",       "skills": "health, privacy, dashboards",        "tags": "health, bi",          "rating": 3.8, "completion_rate": 0.44},
+        {"course_id": 105, "title": "Practical SQL",             "description": "Joins, windows, perf",         "skills": "sql, etl",                           "tags": "data, warehouse",     "rating": 4.7, "completion_rate": 0.69},
+        {"course_id": 106, "title": "Cloud Data Engineering",    "description": "Pipelines, ETL",               "skills": "cloud, etl, python",                "tags": "gcp, pipelines",      "rating": 4.2, "completion_rate": 0.48},
+        {"course_id": 107, "title": "Data Dashboards",           "description": "PowerBI and JS basics",        "skills": "dashboards, powerbi, javascript",   "tags": "bi, viz",             "rating": 3.3, "completion_rate": 0.35},  # deliberately low
+    ])
 
-# deterministic-enough, timestamp-based id (works in UI & CLI)
-def new_id(prefix: str) -> str:
-    ts = datetime.now().strftime("%Y%m%d%H%M%S%f")
-    return f"{prefix}{ts[-10:]}"  # last 10 digits to keep things short
+    # Course skill mapping table format (explode skills)
+    course_skills = courses.assign(skill_list=courses.skills.str.split(",")).explode("skill_list")
+    course_skills["skill_list"] = course_skills["skill_list"].str.strip()
+    course_skills = course_skills[["course_id","skill_list"]].rename(columns={"skill_list":"skill"})
 
-# simple generic upsert utility by a unique key column
+    # Enrollments (progress in 0..1, quiz_score optional)
+    enrollments = pd.DataFrame([
+        {"user_id": 1, "course_id": 101, "progress": 0.60, "quiz_score": 75},
+        {"user_id": 1, "course_id": 102, "progress": 0.20, "quiz_score": None},
+        {"user_id": 1, "course_id": 103, "progress": 1.00, "quiz_score": 82},
+        {"user_id": 2, "course_id": 103, "progress": 1.00, "quiz_score": 88},
+        {"user_id": 2, "course_id": 104, "progress": 0.45, "quiz_score": 65},
+    ])
 
-def upsert_csv(name: str, key_col: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    df = load_df(name)
-    key = row[key_col]
-    df = df[df[key_col] != key]
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    save_df(name, df)
-    return row
+    # Events (views & quizzes) to compute engagement
+    np.random.seed(42)
+    events_rows = []
+    for u in users.user_id:
+        for cid in courses.course_id:
+            if np.random.rand() < 0.25:  # some interactions
+                for _ in range(np.random.randint(1,4)):
+                    dt = datetime.utcnow() - timedelta(days=np.random.randint(0, 45))
+                    duration = float(np.random.uniform(60, 600))
+                    is_quiz = np.random.rand() < 0.3
+                    score = float(np.random.uniform(50, 100)) if is_quiz else None
+                    events_rows.append({
+                        "user_id": u,
+                        "course_id": cid,
+                        "event_type": "quiz" if is_quiz else "view",
+                        "duration_seconds": duration,
+                        "score": score,
+                        "created_at": dt,
+                    })
+    events = pd.DataFrame(events_rows)
 
-# metrics used both by UI and CLI
+    # Roles & required skills (weights allowed)
+    roles = pd.DataFrame([
+        {"role_id": 201, "name": "Data Analyst",     "required_skills": {"python":1.0, "sql":1.0, "dashboards":0.7}},
+        {"role_id": 202, "name": "ML Engineer",      "required_skills": {"python":1.0, "ml":1.0, "cloud":0.6}},
+        {"role_id": 203, "name": "Ops (Logistics)", "required_skills": {"excel":1.0, "logistics":1.0}},
+        {"role_id": 204, "name": "Health Analyst",  "required_skills": {"health":1.0, "privacy":0.8}},
+    ])
 
-def quick_metrics() -> Dict[str, Any]:
-    enr = load_df("enrollments.csv")
-    apps = load_df("applications.csv")
-    mods = load_df("modules.csv")
-
-    completion = float(enr["status"].eq("completed").mean() * 100) if len(enr) else 0.0
-    placement = float(apps["stage"].eq("offer").mean() * 100) if len(apps) else 0.0
-
-    mix = pd.DataFrame()
-    if not mods.empty and "claim_agency" in mods.columns:
-        mix = (
-            mods.groupby("claim_agency")["fee_rm"].sum().reset_index().rename(columns={"fee_rm": "total_fee_rm"})
-        )
     return {
-        "completion_rate_pct": round(completion, 1),
-        "placement_rate_pct": round(placement, 1),
-        "funding_mix_rows": int(len(mix)),
+        "users": users,
+        "companies": companies,
+        "skills": pd.DataFrame({"skill": skills}),
+        "courses": courses,
+        "course_skills": course_skills,
+        "enrollments": enrollments,
+        "events": events,
+        "roles": roles,
     }
 
-# ----------------------------------------------------------------------------
-# CLI fallback (self-tests)
-# ----------------------------------------------------------------------------
+DATA = seed_data()
 
-def run_self_tests() -> Dict[str, Any]:
-    """Exercise CRUD flows for all roles and assert basic invariants.
-    Tests are **additive** and idempotent-friendly.
+# =============================================================
+# TF-IDF vectorizer (content-based)
+# =============================================================
+@st.cache_resource(show_spinner=False)
+def build_vectorizer(courses: pd.DataFrame, course_skills: pd.DataFrame) -> Tuple[TfidfVectorizer, np.ndarray, List[int]]:
+    """Build TF-IDF vectorizer + course matrix + ordered course_ids."""
+    skill_map = course_skills.groupby("course_id")["skill"].apply(lambda s: " ".join(s)).to_dict()
+    texts, ids = [], []
+    for _, row in courses.iterrows():
+        blob = " ".join([
+            str(row.get("title","")),
+            str(row.get("description","")),
+            str(row.get("tags","")),
+            skill_map.get(row.course_id, "")
+        ])
+        texts.append(blob)
+        ids.append(int(row.course_id))
+    vec = TfidfVectorizer(stop_words="english", max_features=5000, ngram_range=(1,2))
+    X = vec.fit_transform(texts)
+    return vec, X, ids
+
+# Initial vectorizer
+vectorizer, course_matrix, course_ids = build_vectorizer(DATA["courses"], DATA["course_skills"])
+
+# Proper global update helper (prevents global-declaration SyntaxError)
+def rebuild_vectorizer(courses: pd.DataFrame, course_skills: pd.DataFrame) -> None:
+    global vectorizer, course_matrix, course_ids
+    vectorizer, course_matrix, course_ids = build_vectorizer(courses, course_skills)
+
+# =============================================================
+# Analytics helpers
+# =============================================================
+
+def learner_analytics(user_id: int) -> Dict[str, object]:
+    enrolls = DATA["enrollments"][DATA["enrollments"].user_id == user_id]
+    events = DATA["events"][DATA["events"].user_id == user_id]
+
+    now = datetime.utcnow().date()
+    last_30 = now - timedelta(days=30)
+    active_days_last_30 = 0
+    time_on_platform = 0.0
+    avg_quiz = None
+
+    if not events.empty:
+        events = events.copy()
+        events["day"] = events["created_at"].dt.date
+        recent = events[events["day"] >= last_30]
+        active_days_last_30 = int(recent["day"].nunique())
+        time_on_platform = float(events["duration_seconds"].sum())
+        quiz_scores = events.query("event_type == 'quiz'")[["score"]].dropna()
+        avg_quiz = float(quiz_scores["score"].mean()) if not quiz_scores.empty else None
+
+    courses_in_progress = int((enrolls["progress"] < 1.0).sum()) if not enrolls.empty else 0
+    completion_rate = float((enrolls["progress"] >= 1.0).mean()) if not enrolls.empty else 0.0
+
+    return {
+        "user_id": user_id,
+        "active_days_last_30": active_days_last_30,
+        "time_on_platform_seconds": round(time_on_platform, 1),
+        "courses_in_progress": courses_in_progress,
+        "completion_rate": round(completion_rate, 3),
+        "avg_quiz_score": None if avg_quiz is None else round(avg_quiz, 2),
+    }
+
+
+def company_analytics(company_id: int) -> Dict[str, object]:
+    users = DATA["users"][DATA["users"].company_id == company_id]
+    user_ids = users.user_id.tolist()
+    events = DATA["events"][DATA["events"].user_id.isin(user_ids)]
+    enrolls = DATA["enrollments"][DATA["enrollments"].user_id.isin(user_ids)]
+
+    now = datetime.utcnow().date()
+    last_1 = now - timedelta(days=1)
+    last_30 = now - timedelta(days=30)
+
+    dau = mau = 0
+    if not events.empty:
+        events = events.copy()
+        events["day"] = events["created_at"].dt.date
+        dau = int(events[events["day"] >= last_1]["user_id"].nunique())
+        mau = int(events[events["day"] >= last_30]["user_id"].nunique())
+    dau_mau = round((dau / mau) if mau else 0.0, 3)
+
+    avg_completion = 0.0
+    if not enrolls.empty:
+        avg_completion = float((enrolls["progress"] >= 1.0).sum() / max(len(enrolls),1))
+
+    top_skills: List[List[object]] = []
+    heatmap: Dict[str, float] = {}
+    if not events.empty:
+        cids = events["course_id"].unique().tolist()
+        cskills = DATA["course_skills"][DATA["course_skills"].course_id.isin(cids)]
+        counts = cskills["skill"].value_counts().head(10)
+        top_skills = list(map(lambda kv: [kv[0], int(kv[1])], counts.items()))
+
+        completed = enrolls[enrolls["progress"] >= 1.0]
+        skill_to_users: Dict[str, Set[int]] = {}
+        for _, row in completed.iterrows():
+            sk = DATA["course_skills"][DATA["course_skills"].course_id == row.course_id]["skill"].tolist()
+            for sname in sk:
+                skill_to_users.setdefault(sname, set()).add(int(row.user_id))
+        N = max(len(user_ids), 1)
+        for sname, users_set in skill_to_users.items():
+            heatmap[sname] = round(len(users_set) / N, 3)
+
+    return {
+        "company_id": company_id,
+        "dau": dau,
+        "mau": mau,
+        "dau_mau": dau_mau,
+        "avg_completion_rate": round(avg_completion, 3),
+        "top_skills_trained": top_skills,
+        "skill_gap_heatmap": heatmap,
+    }
+
+# =============================================================
+# Rule-based scoring
+# =============================================================
+
+def quality_prior(course_row: pd.Series) -> float:
+    rating = float(course_row.get("rating", 4.0) or 4.0)
+    comp = float(course_row.get("completion_rate", 0.6) or 0.6)
+    if rating < LOW_RATING_THRESHOLD or comp < LOW_COMPLETION_THRESHOLD:
+        q = max(0.0, min(1.0, (rating - 2.0)/3.0)) * 0.7 + max(0.0, min(1.0, comp)) * 0.3
+    else:
+        q = min(1.0, (rating/5.0)*0.7 + comp*0.3)
+    return float(q)
+
+
+def learner_verified_skills(user_id: int) -> Set[str]:
+    out: Set[str] = set()
+    completed = DATA["enrollments"][
+        (DATA["enrollments"].user_id == user_id) & (DATA["enrollments"]["progress"] >= 1.0)
+    ]
+    for cid in completed["course_id"].tolist():
+        out |= set(DATA["course_skills"][DATA["course_skills"].course_id == cid]["skill"].tolist())
+    return out
+
+
+def learner_missing_skills(user_id: int, target_role_id: int) -> Set[str]:
+    role = DATA["roles"][DATA["roles"].role_id == target_role_id].iloc[0]
+    required = set(role.required_skills.keys())
+    have = learner_verified_skills(user_id)
+    return required - have
+
+
+def rule_score_for_user(user_id: int, course_id: int, target_role_id: Optional[int]) -> float:
+    enrolls = DATA["enrollments"][DATA["enrollments"].user_id == user_id]
+    course_row = DATA["courses"][DATA["courses"].course_id == course_id].iloc[0]
+
+    if not enrolls.empty and course_id in enrolls[enrolls["progress"] >= 1.0]["course_id"].tolist():
+        return 0.0
+
+    score = 0.2
+
+    row = enrolls[enrolls["course_id"] == course_id]
+    if not row.empty:
+        p = float(row.iloc[0]["progress"])
+        if UNFINISHED_BOOST_RANGE[0] <= p <= UNFINISHED_BOOST_RANGE[1]:
+            score += 0.4
+
+    score += 0.3 * quality_prior(course_row)
+
+    if target_role_id:
+        role = DATA["roles"][DATA["roles"].role_id == target_role_id].iloc[0]
+        role_skills = set(role.required_skills.keys())
+        course_sk = set(DATA["course_skills"][DATA["course_skills"].course_id == course_id]["skill"].tolist())
+        overlap = len(course_sk & role_skills)
+        if overlap > 0:
+            score += 0.3 + 0.1 * min(overlap, 3)
+
+        miss = learner_missing_skills(user_id, target_role_id)
+        if miss and len(course_sk & miss) > 0:
+            score += 0.2
+
+    return float(max(0.0, min(1.0, score)))
+
+# =============================================================
+# ML Scoring (TF-IDF)
+# =============================================================
+
+def _to_row_ndarray(x) -> np.ndarray:
+    """Ensure output is a dense NumPy array with shape (1, n)."""
+    # np.asarray converts np.matrix to ndarray; CSR/CSC means/np.matrix also handled
+    arr = np.asarray(x).astype(float)
+    if arr.ndim == 1:
+        return arr.reshape(1, -1)
+    # Some libs return shape (1, n) already; ensure row-major
+    return arr.reshape(1, -1)
+
+
+def learner_profile_vector(user_id: int) -> np.ndarray:
+    """Return a **(1, n)** dense ndarray representing the learner profile.
+
+    We convert any np.matrix / sparse mean results to ndarray via `_to_row_ndarray`
+    to satisfy sklearn's cosine_similarity requirements.
     """
-    results: Dict[str, Any] = {"tests": []}
+    enrolls = DATA["enrollments"][DATA["enrollments"].user_id == user_id]
+    liked = enrolls[enrolls["progress"] >= 0.5]["course_id"].tolist()
+    if not liked:
+        return _to_row_ndarray(course_matrix.mean(axis=0))  # cold start
+    idxs = [course_ids.index(cid) for cid in liked if cid in course_ids]
+    if not idxs:
+        return _to_row_ndarray(course_matrix.mean(axis=0))
+    return _to_row_ndarray(course_matrix[idxs].mean(axis=0))
 
-    # 0) Files exist
-    files = list_files()
-    assert set(FILES.keys()).issubset(set(files)), "Missing required CSV files"
-    results["tests"].append({"name": "files_exist", "ok": True})
 
-    # 1) Default users include 5 roles
-    users = load_df("users.csv")
-    for role in ["student", "university", "hrdf", "company", "admin"]:
-        assert (users["role"] == role).any(), f"Missing default user for role '{role}'"
-    results["tests"].append({"name": "default_users_present", "ok": True})
+def ml_scores_for_user(user_id: int) -> Dict[int, float]:
+    prof = learner_profile_vector(user_id)  # guaranteed (1, n) ndarray
+    sims = cosine_similarity(prof, course_matrix).flatten()
+    mn, mx = sims.min(), sims.max()
+    denom = (mx - mn) or 1.0
+    sims = (sims - mn) / denom
+    return {cid: float(sims[i]) for i, cid in enumerate(course_ids)}
 
-    # 2) Student: create enrollment + attendance
-    enr_before = len(load_df("enrollments.csv"))
-    enr_id = new_id("ENR")
-    upsert_csv("enrollments.csv", "enroll_id", {
-        "enroll_id": enr_id,
-        "user_id": "S001",
-        "module_code": "AI101",
-        "status": "active",
-        "grade": "",
-        "attendance_hours": 0,
-    })
-    assert len(load_df("enrollments.csv")) >= enr_before + 1
+# =============================================================
+# Hybrid recommendations & Skill gap report
+# =============================================================
 
-    att_before = len(load_df("attendance.csv"))
-    att_id = new_id("ATT")
-    upsert_csv("attendance.csv", "event_id", {
-        "event_id": att_id,
-        "enroll_id": enr_id,
-        "date": date.today().isoformat(),
-        "hours": 2,
-        "mode": "live",
-    })
-    assert len(load_df("attendance.csv")) >= att_before + 1
-    results["tests"].append({"name": "student_enrollment_attendance", "ok": True})
+def recommend_courses(user_id: int, k: int = 5, alpha: float = DEFAULT_ALPHA, target_role_id: Optional[int] = None) -> List[Dict[str, object]]:
+    ml_scores = ml_scores_for_user(user_id)
+    recs = []
+    for cid in course_ids:
+        r = rule_score_for_user(user_id, cid, target_role_id)
+        m = ml_scores.get(cid, 0.0)
+        score = float(alpha) * r + (1.0 - float(alpha)) * m
+        cr = DATA["courses"][DATA["courses"].course_id == cid].iloc[0]
+        recs.append({
+            "course_id": cid,
+            "title": cr.title,
+            "rule": round(r,3),
+            "ml": round(m,3),
+            "score": round(score,3)
+        })
+    completed_ids = set(DATA["enrollments"][
+        (DATA["enrollments"].user_id==user_id) & (DATA["enrollments"]["progress"]>=1.0)
+    ]["course_id"].tolist())
+    recs.sort(key=lambda x: (x["course_id"] in completed_ids, -x["score"]))
+    return recs[:k]
 
-    # 3) University: upsert a module + credit map row
-    mod_before = len(load_df("modules.csv"))
-    upsert_csv("modules.csv", "module_code", {
-        "module_code": "LG101",
-        "module_name": "Logistics Optimization (Cert)",
-        "industry": "Logistics",
-        "claimable": "yes",
-        "claim_agency": "PTPK",
-        "hours": 180,
-        "outcomes": "Routing; WMS; Excel",
-        "fee_rm": 12000,
-    })
-    assert len(load_df("modules.csv")) >= mod_before  # upsert may overwrite
 
-    cm_before = len(load_df("credit_map.csv")) if os.path.exists(os.path.join(DATA_DIR, "credit_map.csv")) else 0
-    upsert_csv("credit_map.csv", "module_code", {
-        "module_code": "LG101",
-        "university_org_id": "ORG_MMU",
-        "degree_program": "BBA Supply Chain",
-        "credits_awarded": 12,
-    })
-    assert len(load_df("credit_map.csv")) >= cm_before + 0  # allow overwrite
-    results["tests"].append({"name": "university_module_creditmap", "ok": True})
+def suggest_courses_for_skill(skill: str, completed_ids: Set[int]) -> List[Dict[str, object]]:
+    rows = DATA["course_skills"][DATA["course_skills"].skill == skill]["course_id"].tolist()
+    ranked = []
+    for cid in rows:
+        if cid in completed_ids:
+            continue
+        cr = DATA["courses"][DATA["courses"].course_id == cid].iloc[0]
+        ranked.append({"course_id": cid, "quality": round(quality_prior(cr), 3), "title": cr.title})
+    ranked.sort(key=lambda x: x["quality"], reverse=True)
+    return ranked[:3]
 
-    # 4) HRDF: create a claim
-    clm_before = len(load_df("claims.csv"))
-    clm_id = new_id("CLM")
-    upsert_csv("claims.csv", "claim_id", {
-        "claim_id": clm_id,
-        "claim_type": "HRDF",
-        "org_id": "ORG_EE",
-        "user_id": "S001",
-        "module_code": "AI101",
-        "amount_rm": 5000,
-        "status": "in_progress",
-    })
-    assert len(load_df("claims.csv")) >= clm_before + 1
-    results["tests"].append({"name": "hrdf_claim", "ok": True})
 
-    # 5) Company: job + application
-    job_before = len(load_df("jobs.csv"))
-    job_id = new_id("JOB")
-    upsert_csv("jobs.csv", "job_id", {
-        "job_id": job_id,
-        "org_id": "ORG_EE",
-        "title": "Junior Data Analyst",
-        "skills": "python, sql, pandas",
-        "location": "Penang",
-        "salary_min": 3500,
-        "salary_max": 4500,
-        "status": "open",
-    })
-    assert len(load_df("jobs.csv")) >= job_before + 1
+def skill_gap_report(user_id: int, target_role_id: int) -> Dict[str, object]:
+    role = DATA["roles"][DATA["roles"].role_id == target_role_id].iloc[0]
+    missing = learner_missing_skills(user_id, target_role_id)
+    completed_ids = set(DATA["enrollments"][DATA["enrollments"].user_id == user_id]["course_id"].tolist())
+    suggestions = {s: suggest_courses_for_skill(s, completed_ids) for s in missing}
+    sorted_missing = sorted(list(missing), key=lambda s: -role.required_skills.get(s, 0))
+    return {"missing_skills": sorted_missing, "suggested_courses": suggestions}
 
-    app_before = len(load_df("applications.csv"))
-    app_id = new_id("APP")
-    upsert_csv("applications.csv", "app_id", {
-        "app_id": app_id,
-        "job_id": job_id,
-        "user_id": "S001",
-        "stage": "screen",
-        "score": 0.7,
-    })
-    assert len(load_df("applications.csv")) >= app_before + 1
-    results["tests"].append({"name": "company_job_application", "ok": True})
+# =============================================================
+# Self-tests (minimal unit checks)
+# =============================================================
 
-    # 6) Admin: user + organization, plus metrics are sane
-    usr_before = len(load_df("users.csv"))
-    usr_id = new_id("USR")
-    upsert_csv("users.csv", "user_id", {
-        "user_id": usr_id,
-        "name": "New User",
-        "role": "student",
-        "username": "123",
-        "password": "123",
-    })
-    assert len(load_df("users.csv")) >= usr_before + 1
-
-    org_before = len(load_df("organizations.csv"))
-    org_id = new_id("ORG")
-    upsert_csv("organizations.csv", "org_id", {
-        "org_id": org_id,
-        "org_name": "New Org",
-        "type": "employer",
-        "levy_balance_rm": 0,
-    })
-    assert len(load_df("organizations.csv")) >= org_before + 1
-
-    metrics = quick_metrics()
-    assert 0.0 <= metrics["completion_rate_pct"] <= 100.0
-    assert 0.0 <= metrics["placement_rate_pct"] <= 100.0
-    results["tests"].append({"name": "admin_users_orgs_metrics", "ok": True, "metrics": metrics})
-
-    # 7) EXTRA TESTS (added): upsert overwrite & cache invalidation safety
-    # 7a) Upsert overwrite: re-save LG101 with different fee, ensure single row and value updated
-    mods_before = load_df("modules.csv").copy()
-    upsert_csv("modules.csv", "module_code", {
-        "module_code": "LG101",
-        "module_name": "Logistics Optimization (Cert)",
-        "industry": "Logistics",
-        "claimable": "yes",
-        "claim_agency": "PTPK",
-        "hours": 180,
-        "outcomes": "Routing; WMS; Excel",
-        "fee_rm": 9999,
-    })
-    mods_after = load_df("modules.csv")
-    assert (mods_after["module_code"] == "LG101").sum() == 1
-    assert int(mods_after.loc[mods_after["module_code"] == "LG101", "fee_rm"].iloc[0]) == 9999
-    results["tests"].append({"name": "upsert_overwrite_singleton", "ok": True})
-
-    # 7b) Cache invalidation path should not crash even without Streamlit
+def run_self_tests() -> List[str]:
+    msgs: List[str] = []
+    # Test 1: TF-IDF integrity
     try:
-        df_copy = load_df("users.csv").copy()
-        save_df("users.csv", df_copy)
-        results["tests"].append({"name": "cache_invalidation_no_crash", "ok": True})
+        assert len(course_ids) == DATA["courses"].shape[0]
+        msgs.append("✔ TF-IDF course_ids length matches courses")
+    except AssertionError:
+        msgs.append("✘ TF-IDF course_ids length mismatch")
+
+    # Test 2: rule demotes completed (existing behavior)
+    try:
+        r = rule_score_for_user(1, 103, None)  # user 1 completed 103
+        assert r == 0.0
+        msgs.append("✔ Rule score is 0 for completed course")
+    except AssertionError:
+        msgs.append("✘ Rule score for completed course not zero")
+
+    # Test 3: ML scores dict available
+    try:
+        scores = ml_scores_for_user(1)
+        assert isinstance(scores, dict) and len(scores) == len(course_ids)
+        msgs.append("✔ ML scores dict present for all courses")
+    except AssertionError:
+        msgs.append("✘ ML scores dict missing/size mismatch")
+
+    # New Test 4: quality prior demotes low-rated course 107 vs 105
+    try:
+        q107 = quality_prior(DATA["courses"][DATA["courses"].course_id == 107].iloc[0])
+        q105 = quality_prior(DATA["courses"][DATA["courses"].course_id == 105].iloc[0])
+        assert q107 < q105
+        msgs.append("✔ Quality prior lower for low-rated course (107 < 105)")
+    except AssertionError:
+        msgs.append("✘ Quality prior did not demote low-rated course")
+
+    # New Test 5: vectorizer rebuild updates size
+    try:
+        before = len(course_ids)
+        new_id = int(DATA["courses"]["course_id"].max()) + 1
+        DATA["courses"] = pd.concat([
+            DATA["courses"],
+            pd.DataFrame([{ "course_id": new_id, "title": "Tmp Course", "description": "tmp", "tags": "tmp", "skills": "python", "rating": 4.0, "completion_rate": 0.5 }])
+        ], ignore_index=True)
+        DATA["course_skills"] = pd.concat([DATA["course_skills"], pd.DataFrame([{ "course_id": new_id, "skill": "python" }])], ignore_index=True)
+        rebuild_vectorizer(DATA["courses"], DATA["course_skills"])
+        after = len(course_ids)
+        assert after == before + 1
+        msgs.append("✔ Rebuild vectorizer reflects newly added course")
+    except AssertionError:
+        msgs.append("✘ Vectorizer rebuild did not reflect new course")
     except Exception as e:
-        results["tests"].append({"name": "cache_invalidation_no_crash", "ok": False, "error": str(e)})
-        raise
+        msgs.append(f"✘ Vectorizer rebuild raised exception: {e}")
+    finally:
+        # remove temp row to keep demo stable
+        DATA["courses"] = DATA["courses"][DATA["courses"].course_id != new_id].reset_index(drop=True)
+        DATA["course_skills"] = DATA["course_skills"][DATA["course_skills"].course_id != new_id].reset_index(drop=True)
+        rebuild_vectorizer(DATA["courses"], DATA["course_skills"])  # restore
 
-    # Save a machine-readable report
-    report_path = os.path.join(EXPORT_DIR, "self_test_report.json")
-    with open(report_path, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-    results["report_path"] = report_path
+    # New Test 6: learner_profile_vector returns (1, n) ndarray
+    try:
+        prof = learner_profile_vector(1)
+        assert isinstance(prof, np.ndarray) and prof.ndim == 2 and prof.shape[0] == 1
+        msgs.append("✔ Learner profile is a (1, n) ndarray (not np.matrix)")
+    except AssertionError:
+        msgs.append("✘ Learner profile is not a (1, n) ndarray")
 
-    return results
+    # New Test 7: cosine_similarity executes without type errors
+    try:
+        _ = ml_scores_for_user(1)
+        msgs.append("✔ cosine_similarity ran without type errors")
+    except Exception as e:
+        msgs.append(f"✘ cosine_similarity raised: {e}")
 
-# ----------------------------------------------------------------------------
-# Streamlit UI (only runs if Streamlit is installed)
-# ----------------------------------------------------------------------------
-if HAS_STREAMLIT:
-    # Top-level UI definition so `streamlit run` renders immediately
-    st.set_page_config(page_title="Raw Data Entry + Analysis", layout="wide")
+    return msgs
 
-    # Demo auth (do NOT use in production)
-    ROLES = ["student", "university", "hrdf", "company", "admin"]
+# =============================================================
+# UI (Streamlit) or CLI demo
+# =============================================================
 
-    def login_ui():
-        st.sidebar.header("Login")
-        role = st.sidebar.selectbox("Role", ROLES, index=0, help="Select your portal role")
-        username = st.sidebar.text_input("Username", value="123")
-        password = st.sidebar.text_input("Password", type="password", value="123")
-        ok = st.sidebar.button("Sign in")
-        if ok:
-            if username == "123" and password == "123":
-                st.session_state["authed_role"] = role
-                st.session_state["username"] = username
-                st.session_state["login_time"] = datetime.now().isoformat()
-                st.sidebar.success(f"Signed in as {role}")
-            else:
-                st.sidebar.error("Invalid credentials (demo expects 123/123)")
+def _ui_streamlit():  # UI path (only when Streamlit is installed)
+    portal = st.sidebar.radio("Portal", ["Learner", "Trainer", "Employer", "Admin"], index=0)
+    alpha = st.sidebar.slider("Hybrid α (rule vs ML)", 0.0, 1.0, DEFAULT_ALPHA, 0.05, help="Final score = α*rule + (1-α)*ML")
 
-    if "authed_role" not in st.session_state:
-        login_ui()
-        # Stop rendering until authed
-        if "authed_role" not in st.session_state:
-            st.stop()
+    st.sidebar.markdown("---")
+    role_names = DATA["roles"]["name"].tolist()
+    role_label_to_id = {row["name"]: row["role_id"] for _, row in DATA["roles"].iterrows()}
+    selected_role_label = st.sidebar.selectbox("Target role for alignment (optional)", ["(none)"] + role_names, index=0)
+    selected_role_id = None if selected_role_label == "(none)" else role_label_to_id[selected_role_label]
 
-    # Common widgets
-    def table_view(name: str):
-        st.subheader(f"Current data — {name}")
-        df = load_df(name)
-        st.dataframe(df, use_container_width=True)
-        st.download_button(
-            f"Download {name}",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=name,
-            mime="text/csv",
-        )
+    if portal == "Learner":
+        st.header("🎓 Learner Dashboard")
+        learner_name = st.selectbox("Select Learner", DATA["users"][DATA["users"]["role"]=="learner"]["name"].tolist(), index=0)
+        uid = int(DATA["users"][DATA["users"]["name"]==learner_name]["user_id"].iloc[0])
 
-    role = st.session_state["authed_role"]
-    st.title("📦 Raw Data Entry + Quick Analysis")
-    st.caption("Demo login for ALL roles: username 123 / password 123")
-    st.toast(f"Logged in as '{role}'", icon="✅")
+        st.subheader("Analytics")
+        la = learner_analytics(uid)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Active days (30d)", la["active_days_last_30"]) 
+        c2.metric("Time on platform (s)", la["time_on_platform_seconds"]) 
+        c3.metric("In-progress", la["courses_in_progress"]) 
+        c4.metric("Completion rate", f"{la['completion_rate']*100:.1f}%") 
+        c5.metric("Avg quiz", "-" if la["avg_quiz_score"] is None else la["avg_quiz_score"])
 
-    # ───── Student ───────────────────────────────────────────────────────────
-    if role == "student":
-        st.header("🎓 Student Portal")
-        udf = load_df("users.csv")
-        students = udf[udf["role"] == "student"]
-        if students.empty:
-            st.info("No student users available. Ask Admin to create one in users.csv.")
+        st.subheader("Recommendations (hybrid)")
+        k = st.number_input("Top K", min_value=1, max_value=20, value=5)
+        recs = recommend_courses(uid, k=int(k), alpha=alpha, target_role_id=selected_role_id)
+        st.dataframe(recs, use_container_width=True)
+
+        st.subheader("Skill Gap vs Target Role")
+        if selected_role_id is None:
+            st.info("Select a target role in the sidebar to compute skill gaps.")
         else:
-            student_id = st.selectbox("Select your ID", students["user_id"].tolist())
+            gap = skill_gap_report(uid, selected_role_id)
+            colA, colB = st.columns(2)
+            with colA:
+                st.write("**Missing skills (sorted):**", gap["missing_skills"]) 
+            with colB:
+                st.write("**Suggested courses per skill:**")
+                st.json(gap["suggested_courses"])
 
-            st.subheader("Add/Update Enrollment")
-            with st.form("enr_form"):
-                enroll_id = st.text_input("Enroll ID (leave blank for auto)")
-                module_code = st.text_input("Module Code", value="AI101")
-                status = st.selectbox("Status", ["planned", "active", "completed"], index=1)
-                grade = st.text_input("Grade", value="")
-                att_hours = st.number_input("Attendance Hours", min_value=0, value=0)
-                submitted = st.form_submit_button("Save Enrollment")
-            if submitted:
-                if not enroll_id:
-                    enroll_id = new_id("ENR")
-                row = {
-                    "enroll_id": enroll_id,
-                    "user_id": student_id,
-                    "module_code": module_code,
-                    "status": status,
-                    "grade": grade,
-                    "attendance_hours": att_hours,
-                }
-                upsert_csv("enrollments.csv", "enroll_id", row)
-                st.success(f"Enrollment saved: {enroll_id}")
+    elif portal == "Trainer":
+        st.header("👩‍🏫 Trainer Dashboard")
+        st.write("Create or review courses (demo only). New courses affect ML vectorizer live.")
+        with st.expander("Create Course"):
+            t = st.text_input("Title")
+            d = st.text_area("Description")
+            tg = st.text_input("Tags (comma-separated)")
+            sk = st.text_input("Skills (comma-separated)")
+            rating = st.slider("Historic rating", 1.0, 5.0, 4.2, 0.1)
+            comp = st.slider("Historic completion rate", 0.0, 1.0, 0.55, 0.01)
+            if st.button("Add Course"):
+                new_id = int(DATA["courses"]["course_id"].max()) + 1
+                DATA["courses"] = pd.concat([
+                    DATA["courses"],
+                    pd.DataFrame([{ "course_id": new_id, "title": t, "description": d, "tags": tg, "skills": sk, "rating": float(rating), "completion_rate": float(comp)}])
+                ], ignore_index=True)
+                if sk.strip():
+                    rows = [{"course_id": new_id, "skill": s.strip()} for s in sk.split(",")]
+                    DATA["course_skills"] = pd.concat([DATA["course_skills"], pd.DataFrame(rows)], ignore_index=True)
+                st.success(f"Course {new_id} added.")
+                rebuild_vectorizer(DATA["courses"], DATA["course_skills"])  
+                st.toast("Vectorizer retrained.")
 
-            table_view("enrollments.csv")
+        st.subheader("All Courses")
+        st.dataframe(DATA["courses"][ ["course_id","title","rating","completion_rate","skills"] ], use_container_width=True)
 
-            st.subheader("Log Attendance")
-            with st.form("att_form"):
-                event_id = st.text_input("Event ID (auto if blank)")
-                sel_enr_df = load_df("enrollments.csv")
-                sel_enr_list = sel_enr_df["enroll_id"].tolist() if not sel_enr_df.empty else []
-                sel_enr = st.selectbox("Enrollment", sel_enr_list)
-                d = st.date_input("Date")
-                hours = st.number_input("Hours", min_value=0, value=2)
-                mode = st.selectbox("Mode", ["live", "recording"], index=0)
-                ok = st.form_submit_button("Save Attendance")
-            if ok:
-                if not event_id:
-                    event_id = new_id("ATT")
-                row = {"event_id": event_id, "enroll_id": sel_enr, "date": str(d), "hours": hours, "mode": mode}
-                upsert_csv("attendance.csv", "event_id", row)
-                st.success(f"Attendance saved: {event_id}")
+    elif portal == "Employer":
+        st.header("🏢 Employer Dashboard")
+        company_name = DATA["companies"].iloc[0]["name"]
+        st.caption(f"Company: {company_name}")
+        ca = company_analytics(1)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("DAU", ca["dau"]) 
+        c2.metric("MAU", ca["mau"]) 
+        c3.metric("DAU/MAU", ca["dau_mau"]) 
+        st.metric("Avg completion rate", f"{ca['avg_completion_rate']*100:.1f}%")
 
-            table_view("attendance.csv")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Top skills trained")
+            st.json(ca["top_skills_trained"])  # [[skill, count], ...]
+        with col2:
+            st.subheader("Skill proficiency heatmap")
+            st.json(ca["skill_gap_heatmap"])   # {skill: % proficient}
 
-    # ───── University ────────────────────────────────────────────────────────
-    elif role == "university":
-        st.header("🏫 University Portal")
-        st.subheader("Create / Edit Module")
-        with st.form("mod_form"):
-            module_code = st.text_input("Module Code", value="AI101")
-            module_name = st.text_input("Module Name", value="AI for E&E (Certificate)")
-            industry = st.text_input("Industry", value="E&E")
-            claimable = st.selectbox("Claimable", ["yes", "no"], index=0)
-            claim_agency = st.selectbox("Claim Agency", ["PTPK", "HRDF", "-"], index=0)
-            hours = st.number_input("Hours", min_value=0, value=180)
-            outcomes = st.text_area("Outcomes", value="Python; data wrangling")
-            fee_rm = st.number_input("Fee (RM)", min_value=0, value=12000)
-            ok = st.form_submit_button("Save Module")
-        if ok:
-            row = {
-                "module_code": module_code,
-                "module_name": module_name,
-                "industry": industry,
-                "claimable": claimable,
-                "claim_agency": claim_agency if claim_agency != "-" else "",
-                "hours": hours,
-                "outcomes": outcomes,
-                "fee_rm": fee_rm,
-            }
-            upsert_csv("modules.csv", "module_code", row)
-            st.success(f"Module saved: {module_code}")
-        table_view("modules.csv")
+    elif portal == "Admin":
+        st.header("⚙️ Admin Dashboard")
+        st.write("System datasets (read-only). Use Trainer to add courses.")
+        msgs = run_self_tests()
+        st.expander("Self-tests").write("\n".join(msgs))
+        tabs = st.tabs(["Users","Courses","Enrollments","Events","Roles","Course-Skills"])
+        with tabs[0]:
+            st.dataframe(DATA["users"], use_container_width=True)
+        with tabs[1]:
+            st.dataframe(DATA["courses"], use_container_width=True)
+        with tabs[2]:
+            st.dataframe(DATA["enrollments"], use_container_width=True)
+        with tabs[3]:
+            st.dataframe(DATA["events"], use_container_width=True)
+        with tabs[4]:
+            st.dataframe(DATA["roles"][ ["role_id","name","required_skills"] ], use_container_width=True)
+        with tabs[5]:
+            st.dataframe(DATA["course_skills"], use_container_width=True)
 
-        st.subheader("Credit Transfer Map")
-        with st.form("credit_form"):
-            cm_module = st.text_input("Module Code (must exist)", value="AI101")
-            uni_org = st.text_input("University Org ID", value="ORG_MMU")
-            degree = st.text_input("Degree Program", value="BSc Data Science")
-            credits = st.number_input("Credits Awarded", min_value=0, value=12)
-            ok2 = st.form_submit_button("Save Credit Map")
-        if ok2:
-            new_row = {"module_code": cm_module, "university_org_id": uni_org, "degree_program": degree, "credits_awarded": credits}
-            # Upsert by module_code for simplicity
-            upsert_csv("credit_map.csv", "module_code", new_row)
-            st.success("Credit map row saved")
-        table_view("credit_map.csv")
+    st.caption("Demo only: hybrid recommender = α*rule + (1-α)*ML. Ratings/completions act as quality priors; low-quality items are demoted. No PII is logged.")
 
-    # ───── HRDF ─────────────────────────────────────────────────────────────
-    elif role == "hrdf":
-        st.header("🏛 HRDF Portal")
-        with st.form("claim_form"):
-            claim_id = st.text_input("Claim ID (auto if blank)")
-            claim_type = st.selectbox("Claim Type", ["HRDF", "PTPK"], index=0)
-            org_id = st.text_input("Org ID", value="ORG_EE")
-            user_id = st.text_input("Trainee User ID", value="S001")
-            module_code = st.text_input("Module Code", value="AI101")
-            amount_rm = st.number_input("Amount (RM)", min_value=0, value=5000)
-            status = st.selectbox("Status", ["in_progress", "approved", "rejected"], index=0)
-            ok = st.form_submit_button("Save Claim")
-        if ok:
-            if not claim_id:
-                claim_id = new_id("CLM")
-            row = {
-                "claim_id": claim_id,
-                "claim_type": claim_type,
-                "org_id": org_id,
-                "user_id": user_id,
-                "module_code": module_code,
-                "amount_rm": amount_rm,
-                "status": status,
-            }
-            upsert_csv("claims.csv", "claim_id", row)
-            st.success(f"Claim saved: {claim_id}")
-        table_view("claims.csv")
 
-    # ───── Company ──────────────────────────────────────────────────────────
-    elif role == "company":
-        st.header("🏢 Company Portal")
-        with st.form("job_form"):
-            job_id = st.text_input("Job ID (auto if blank)")
-            org_id = st.text_input("Org ID", value="ORG_EE")
-            title = st.text_input("Job Title", value="Junior Data Analyst")
-            skills = st.text_input("Skills (comma-separated)", value="python, sql, pandas")
-            location = st.text_input("Location", value="Penang")
-            salary_min = st.number_input("Salary Min", min_value=0, value=3500)
-            salary_max = st.number_input("Salary Max", min_value=0, value=4500)
-            status = st.selectbox("Status", ["open", "closed"], index=0)
-            ok = st.form_submit_button("Save Job")
-        if ok:
-            if not job_id:
-                job_id = new_id("JOB")
-            row = {
-                "job_id": job_id,
-                "org_id": org_id,
-                "title": title,
-                "skills": skills,
-                "location": location,
-                "salary_min": salary_min,
-                "salary_max": salary_max,
-                "status": status,
-            }
-            upsert_csv("jobs.csv", "job_id", row)
-            st.success(f"Job saved: {job_id}")
-        table_view("jobs.csv")
+def _cli_demo():  # CLI path when Streamlit is missing
+    print("{\"mode\": \"cli\", \"message\": \"Streamlit not found; running CLI demo.\"}")
+    # Run self-tests
+    tests = run_self_tests()
+    print(json.dumps({"self_tests": tests}, indent=2))
 
-        st.subheader("Applications")
-        with st.form("app_form"):
-            app_id = st.text_input("Application ID (auto if blank)")
-            job_id_ref = st.text_input("Job ID (must exist)")
-            user_id = st.text_input("Student User ID", value="S001")
-            stage = st.selectbox("Stage", ["screen", "interview", "offer", "rejected"], index=0)
-            score = st.number_input("Score (0-1)", min_value=0.0, max_value=1.0, value=0.7)
-            ok2 = st.form_submit_button("Save Application")
-        if ok2:
-            if not app_id:
-                app_id = new_id("APP")
-            row = {"app_id": app_id, "job_id": job_id_ref, "user_id": user_id, "stage": stage, "score": score}
-            upsert_csv("applications.csv", "app_id", row)
-            st.success(f"Application saved: {app_id}")
-        table_view("applications.csv")
+    # Show sample analytics and recommendations
+    learner_id = 1
+    company_id = 1
+    role_id = 202  # ML Engineer
 
-    # ───── Admin ────────────────────────────────────────────────────────────
-    elif role == "admin":
-        st.header("🛠️ Admin Portal")
-        st.subheader("Create / Edit User")
-        with st.form("user_form"):
-            user_id = st.text_input("User ID (auto if blank)")
-            name = st.text_input("Name", value="New User")
-            role_pick = st.selectbox("Role", ["student", "university", "hrdf", "company", "admin"], index=0)
-            username = st.text_input("Username", value="123")
-            password = st.text_input("Password", value="123")
-            ok = st.form_submit_button("Save User")
-        if ok:
-            if not user_id:
-                user_id = new_id("USR")
-            row = {"user_id": user_id, "name": name, "role": role_pick, "username": username, "password": password}
-            upsert_csv("users.csv", "user_id", row)
-            st.success(f"User saved: {user_id}")
-        table_view("users.csv")
+    la = learner_analytics(learner_id)
+    ca = company_analytics(company_id)
+    recs = recommend_courses(learner_id, k=5, alpha=DEFAULT_ALPHA, target_role_id=role_id)
+    gap = skill_gap_report(learner_id, role_id)
 
-        st.subheader("Organizations")
-        with st.form("org_form"):
-            org_id = st.text_input("Org ID (auto if blank)")
-            org_name = st.text_input("Org Name", value="Penang E&E Sdn Bhd")
-            typ = st.selectbox("Type", ["employer", "university", "agency"], index=0)
-            levy_balance = st.number_input("Levy Balance (RM)", min_value=0, value=0)
-            ok2 = st.form_submit_button("Save Org")
-        if ok2:
-            if not org_id:
-                org_id = new_id("ORG")
-            row = {"org_id": org_id, "org_name": org_name, "type": typ, "levy_balance_rm": levy_balance}
-            upsert_csv("organizations.csv", "org_id", row)
-            st.success(f"Organization saved: {org_id}")
-        table_view("organizations.csv")
+    out = {
+        "learner_analytics": la,
+        "company_analytics": ca,
+        "recommendations": recs,
+        "skill_gap": gap,
+    }
+    print(json.dumps(out, indent=2, default=str))
 
-        st.subheader("Quick Analysis")
-        m = quick_metrics()
-        c1, c2 = st.columns(2)
-        c1.metric("Completion Rate", f"{m['completion_rate_pct']:.1f}%")
-        c2.metric("Placement (Offer) Rate", f"{m['placement_rate_pct']:.1f}%")
 
-        mods = load_df("modules.csv")
-        st.subheader("Funding Mix by Agency (from modules)")
-        if not mods.empty and "claim_agency" in mods.columns:
-            mix = (
-                mods.groupby("claim_agency")["fee_rm"].sum().reset_index().rename(columns={"fee_rm": "total_fee_rm"})
-            )
-            st.dataframe(mix, use_container_width=True)
-            st.bar_chart(mix.set_index("claim_agency"))
-        else:
-            st.info("No modules data yet.")
-
-    # Footer
-    st.divider()
-    st.caption("⚠️ Demo app: flat-file CSV storage, no real security. Replace with proper auth/DB before production use.")
-
-# ----------------------------------------------------------------------------
-# CLI entrypoint (only active when executing with `python` and no Streamlit)
-# ----------------------------------------------------------------------------
-if __name__ == "__main__" and not HAS_STREAMLIT:
-    print("[RBDEA] Streamlit not found – running in CLI fallback mode.\n")
-    print("- Data dir:   ", os.path.abspath(DATA_DIR))
-    print("- Export dir: ", os.path.abspath(EXPORT_DIR))
-    results = run_self_tests()
-    print("\nSelf-tests completed. Summary:")
-    for t in results.get("tests", []):
-        name = t.get("name")
-        ok = t.get("ok")
-        print(f"  • {name}: {'OK' if ok else 'FAIL'}")
-        if name == "admin_users_orgs_metrics":
-            print(f"    - completion_rate_pct = {t['metrics']['completion_rate_pct']}")
-            print(f"    - placement_rate_pct  = {t['metrics']['placement_rate_pct']}")
-            print(f"    - funding_mix_rows    = {t['metrics']['funding_mix_rows']}")
-    print(f"\nReport saved to: {results['report_path']}")
-    print("\nTip: To use the full UI, install Streamlit and run:\n  pip install streamlit pandas\n  streamlit run role_based_data_entry_app.py\n")
+# Entrypoint selection
+if STREAMLIT_AVAILABLE:
+    _ui_streamlit()
+else:
+    _cli_demo()
