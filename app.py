@@ -8,8 +8,9 @@
 # Fixes included in this version:
 # - Optional Streamlit import (prevents ModuleNotFoundError in sandbox).
 # - Proper `global` placement for vectorizer rebuild.
-# - **NEW**: Convert np.matrix → NumPy ndarray in learner profile vectors to
-#   avoid: "TypeError: np.matrix is not supported" in sklearn cosine_similarity.
+# - Convert np.matrix → NumPy ndarray in learner profile vectors.
+# - **NEW**: Optional scikit-learn. If scikit-learn is missing, fall back to a
+#   lightweight, built-in TF‑IDF + cosine similarity so the demo still runs.
 # - Added extra tests around vector shape and cosine call.
 
 from __future__ import annotations
@@ -17,10 +18,22 @@ import json
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Set, Tuple
 
+import re
+import math
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+
+# ---------------------------
+# Optional scikit-learn import with safe fallback
+# ---------------------------
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer as SklearnTfidfVectorizer  # type: ignore
+    from sklearn.metrics.pairwise import cosine_similarity as sk_cosine_similarity  # type: ignore
+    SKLEARN_AVAILABLE = True
+except Exception:
+    SklearnTfidfVectorizer = None  # type: ignore
+    sk_cosine_similarity = None  # type: ignore
+    SKLEARN_AVAILABLE = False
 
 # ---------------------------
 # Optional Streamlit import with safe fallback
@@ -43,6 +56,13 @@ except Exception:  # pragma: no cover
                 return fn
             return _decorator
 
+        def set_page_config(self, *args, **kwargs):
+            return None
+
+        # Stubs used in CLI mode (no-ops)
+        def sidebar(self):
+            return self
+
     st = _DummyStreamlit()  # type: ignore
 
 # =============================================================
@@ -55,6 +75,83 @@ LOW_COMPLETION_THRESHOLD = 0.40
 
 if STREAMLIT_AVAILABLE:  # UI-only config
     st.set_page_config(page_title="MySkillEdge Demo (Analytics + Recommendations)", layout="wide")
+
+# =============================================================
+# Lightweight TF‑IDF + Cosine fallback (when scikit-learn is unavailable)
+# =============================================================
+_STOPWORDS = {
+    "the","a","an","and","or","for","to","of","in","on","with","by","at","is","are","this","that","it","as","be"
+}
+
+class SimpleTfidfVectorizer:
+    """Very small TF‑IDF Vectorizer for demo fallback.
+    Supports: max_features, ngram_range (1 or 1..2), basic English stopword removal.
+    """
+    def __init__(self, max_features: int = 5000, ngram_range: Tuple[int,int] = (1,2), stop_words: str = "english"):
+        self.max_features = max_features
+        self.ngram_range = ngram_range
+        self.stop_words = _STOPWORDS if stop_words == "english" else set()
+        self.vocab_: Dict[str,int] = {}
+        self.idf_: Optional[np.ndarray] = None
+
+    def _tokenize(self, text: str) -> List[str]:
+        toks = re.findall(r"[a-z0-9]+", text.lower())
+        toks = [t for t in toks if t not in self.stop_words]
+        if self.ngram_range[1] >= 2:
+            bigrams = [f"{toks[i]}_{toks[i+1]}" for i in range(len(toks)-1)]
+            toks = toks + bigrams
+        return toks
+
+    def fit_transform(self, docs: List[str]) -> np.ndarray:
+        # Build vocabulary by term frequency
+        tf_global: Dict[str,int] = {}
+        docs_tokens: List[List[str]] = []
+        for d in docs:
+            tks = self._tokenize(d)
+            docs_tokens.append(tks)
+            for t in tks:
+                tf_global[t] = tf_global.get(t, 0) + 1
+        # Keep top max_features tokens
+        sorted_terms = sorted(tf_global.items(), key=lambda kv: kv[1], reverse=True)[: self.max_features]
+        self.vocab_ = {term:i for i,(term,_) in enumerate(sorted_terms)}
+        V = len(self.vocab_)
+        N = len(docs)
+        # Document frequencies
+        df = np.zeros(V, dtype=float)
+        for tks in docs_tokens:
+            seen = set()
+            for t in tks:
+                idx = self.vocab_.get(t)
+                if idx is not None and idx not in seen:
+                    df[idx] += 1
+                    seen.add(idx)
+        # Smooth IDF
+        self.idf_ = np.log((1.0 + N) / (1.0 + df)) + 1.0
+        # TF * IDF
+        X = np.zeros((N, V), dtype=float)
+        for i, tks in enumerate(docs_tokens):
+            for t in tks:
+                j = self.vocab_.get(t)
+                if j is not None:
+                    X[i, j] += 1.0
+        # Apply IDF
+        X *= self.idf_
+        # L2 normalize rows
+        norms = np.linalg.norm(X, axis=1, keepdims=True) + 1e-12
+        X = X / norms
+        return X
+
+# cosine similarity wrapper
+if SKLEARN_AVAILABLE:
+    def cosine_sim(A, B):
+        return sk_cosine_similarity(A, B)
+else:
+    def cosine_sim(A, B):
+        A = np.asarray(A, dtype=float)
+        B = np.asarray(B, dtype=float)
+        A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-12)
+        B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-12)
+        return A @ B.T
 
 # =============================================================
 # Synthetic Mock Data (idempotent)
@@ -89,7 +186,7 @@ def seed_data() -> Dict[str, pd.DataFrame]:
         {"course_id": 104, "title": "Healthcare Data",           "description": "Privacy and dashboards",       "skills": "health, privacy, dashboards",        "tags": "health, bi",          "rating": 3.8, "completion_rate": 0.44},
         {"course_id": 105, "title": "Practical SQL",             "description": "Joins, windows, perf",         "skills": "sql, etl",                           "tags": "data, warehouse",     "rating": 4.7, "completion_rate": 0.69},
         {"course_id": 106, "title": "Cloud Data Engineering",    "description": "Pipelines, ETL",               "skills": "cloud, etl, python",                "tags": "gcp, pipelines",      "rating": 4.2, "completion_rate": 0.48},
-        {"course_id": 107, "title": "Data Dashboards",           "description": "PowerBI and JS basics",        "skills": "dashboards, powerbi, javascript",   "tags": "bi, viz",             "rating": 3.3, "completion_rate": 0.35},  # deliberately low
+        {"course_id": 107, "title": "Data Dashboards",           "description": "PowerBI and JS basics",        "skills": "dashboards, powerbi, javascript",   "tags": "bi, viz",             "rating": 3.3, "completion_rate": 0.35},  # low on purpose
     ])
 
     # Course skill mapping table format (explode skills)
@@ -152,8 +249,17 @@ DATA = seed_data()
 # TF-IDF vectorizer (content-based)
 # =============================================================
 @st.cache_resource(show_spinner=False)
-def build_vectorizer(courses: pd.DataFrame, course_skills: pd.DataFrame) -> Tuple[TfidfVectorizer, np.ndarray, List[int]]:
-    """Build TF-IDF vectorizer + course matrix + ordered course_ids."""
+def build_vectorizer(courses: pd.DataFrame, course_skills: pd.DataFrame) -> Tuple[object, object, List[int]]:
+    """Build TF-IDF vectorizer + course matrix + ordered course_ids.
+
+    Returns
+    -------
+    (vectorizer, X, ids)
+        vectorizer : scikit-learn TfidfVectorizer or SimpleTfidfVectorizer
+        X          : sparse/dense matrix (courses x vocab)
+        ids        : list[int] course_ids aligned with rows of X
+    """
+    # Aggregate text: title + description + tags + skills
     skill_map = course_skills.groupby("course_id")["skill"].apply(lambda s: " ".join(s)).to_dict()
     texts, ids = [], []
     for _, row in courses.iterrows():
@@ -165,8 +271,13 @@ def build_vectorizer(courses: pd.DataFrame, course_skills: pd.DataFrame) -> Tupl
         ])
         texts.append(blob)
         ids.append(int(row.course_id))
-    vec = TfidfVectorizer(stop_words="english", max_features=5000, ngram_range=(1,2))
-    X = vec.fit_transform(texts)
+
+    if SKLEARN_AVAILABLE:
+        vec = SklearnTfidfVectorizer(stop_words="english", max_features=5000, ngram_range=(1,2))
+        X = vec.fit_transform(texts)
+    else:
+        vec = SimpleTfidfVectorizer(max_features=5000, ngram_range=(1,2), stop_words="english")
+        X = vec.fit_transform(texts)
     return vec, X, ids
 
 # Initial vectorizer
@@ -331,20 +442,14 @@ def rule_score_for_user(user_id: int, course_id: int, target_role_id: Optional[i
 
 def _to_row_ndarray(x) -> np.ndarray:
     """Ensure output is a dense NumPy array with shape (1, n)."""
-    # np.asarray converts np.matrix to ndarray; CSR/CSC means/np.matrix also handled
     arr = np.asarray(x).astype(float)
     if arr.ndim == 1:
         return arr.reshape(1, -1)
-    # Some libs return shape (1, n) already; ensure row-major
     return arr.reshape(1, -1)
 
 
 def learner_profile_vector(user_id: int) -> np.ndarray:
-    """Return a **(1, n)** dense ndarray representing the learner profile.
-
-    We convert any np.matrix / sparse mean results to ndarray via `_to_row_ndarray`
-    to satisfy sklearn's cosine_similarity requirements.
-    """
+    """Return a **(1, n)** dense ndarray representing the learner profile."""
     enrolls = DATA["enrollments"][DATA["enrollments"].user_id == user_id]
     liked = enrolls[enrolls["progress"] >= 0.5]["course_id"].tolist()
     if not liked:
@@ -356,8 +461,8 @@ def learner_profile_vector(user_id: int) -> np.ndarray:
 
 
 def ml_scores_for_user(user_id: int) -> Dict[int, float]:
-    prof = learner_profile_vector(user_id)  # guaranteed (1, n) ndarray
-    sims = cosine_similarity(prof, course_matrix).flatten()
+    prof = learner_profile_vector(user_id)  # (1, n)
+    sims = cosine_sim(prof, course_matrix).flatten()
     mn, mx = sims.min(), sims.max()
     denom = (mx - mn) or 1.0
     sims = (sims - mn) / denom
@@ -481,9 +586,9 @@ def run_self_tests() -> List[str]:
     # New Test 7: cosine_similarity executes without type errors
     try:
         _ = ml_scores_for_user(1)
-        msgs.append("✔ cosine_similarity ran without type errors")
+        msgs.append("✔ cosine similarity ran without type errors")
     except Exception as e:
-        msgs.append(f"✘ cosine_similarity raised: {e}")
+        msgs.append(f"✘ cosine similarity raised: {e}")
 
     return msgs
 
@@ -600,7 +705,7 @@ def _ui_streamlit():  # UI path (only when Streamlit is installed)
 
 
 def _cli_demo():  # CLI path when Streamlit is missing
-    print("{\"mode\": \"cli\", \"message\": \"Streamlit not found; running CLI demo.\"}")
+    print("{\"mode\": \"cli\", \"message\": \"Streamlit not found or sklearn missing; running CLI demo with fallbacks.\"}")
     # Run self-tests
     tests = run_self_tests()
     print(json.dumps({"self_tests": tests}, indent=2))
